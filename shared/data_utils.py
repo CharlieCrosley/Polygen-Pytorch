@@ -99,7 +99,10 @@ def quantize_verts(verts, n_bits=8):
   range_quantize = 2**n_bits - 1
   verts_quantize = (verts - min_range) * range_quantize / (
       max_range - min_range)
-  return verts_quantize.int()
+  if isinstance(verts_quantize, np.ndarray):
+    return verts_quantize.astype(np.int32)
+  else:
+    return verts_quantize.int()
 
 def dequantize_verts(verts, n_bits=8, add_noise=False):
     """Quantizes vertices and outputs integers with specified n_bits."""

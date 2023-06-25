@@ -182,6 +182,7 @@ class VertexModel(nn.Module):
             sequential_context_embeddings=seq_context)
         return pred_dist
     
+    @torch.no_grad()
     def sample(self,
              num_samples,
              context=None,
@@ -217,6 +218,7 @@ class VertexModel(nn.Module):
             'vertices_mask': Tensor of shape [num_samples, num_verts] that masks
             corresponding invalid elements in 'vertices'.
         """
+        self.eval()
         # Obtain context for decoder
         global_context, seq_context = self.prepare_context(context)
 
@@ -235,23 +237,24 @@ class VertexModel(nn.Module):
         samples = torch.zeros([num_samples, 0], dtype=torch.int32)
         max_sample_length = max_sample_length or self.max_num_input_verts
         cache = self.decoder.create_init_cache(num_samples)
-
+        
         stop_cond = False
         i = 0
         max_iters = max_sample_length * 3 + 1
-        while not stop_cond and i < max_iters:
-            cat_dist = self.create_vertex_coordinate_dist(
-                samples,
-                global_context_embedding=global_context,
-                sequential_context_embeddings=seq_context,
-                cache=cache,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p)
-            next_sample = cat_dist.sample()
-            samples = torch.cat([samples, next_sample], dim=1)
-            stop_cond = torch.eq(samples, 0).any(-1).all() # stop once all samples have a 0 (stop token)
-            i += 1
+        with torch.no_grad():
+            while not stop_cond and i < max_iters:
+                cat_dist = self.create_vertex_coordinate_dist(
+                    samples,
+                    global_context_embedding=global_context,
+                    sequential_context_embeddings=seq_context,
+                    cache=cache,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p)
+                next_sample = cat_dist.sample()
+                samples = torch.cat([samples, next_sample], dim=1)
+                stop_cond = torch.eq(samples, 0).any(-1).all() # stop once all samples have a 0 (stop token)
+                i += 1
 
         # Check if samples completed. Samples are complete if the stopping token
         # is produced.
@@ -298,13 +301,11 @@ class VertexModel(nn.Module):
             vertices -= vert_centers
         vertices *= vertices_mask.unsqueeze(-1)
 
-        
-        if only_return_complete:
-            completed = completed.view(-1,1,1) # add dimensions for broadcasting
-            vertices = torch.masked_select(vertices, completed.view(-1,1,1)).view(-1, max_sample_length, 3)
-            num_vertices = torch.masked_select(num_vertices, completed)
-            vertices_mask = torch.masked_select(vertices_mask, completed)
-            completed = torch.masked_select(completed, completed)
+        if only_return_complete: # mask out incomplete samples
+            vertices = vertices[completed]
+            num_vertices = num_vertices[completed]
+            vertices_mask = vertices_mask[completed]
+            completed = completed[completed]
 
         # Outputs
         outputs = {
@@ -313,6 +314,7 @@ class VertexModel(nn.Module):
             'num_vertices': num_vertices,
             'vertices_mask': vertices_mask,
         }
+        self.train()
         return outputs
 
 class FaceModel(nn.Module):
@@ -375,6 +377,9 @@ class FaceModel(nn.Module):
         self.pos_embd = nn.Embedding(self.max_seq_length, self.embedding_dim)
         self.pos_embd.apply(init_weights)
 
+        self.project_to_pointers = nn.Linear(self.embedding_dim, self.embedding_dim)
+        #self.project_to_pointers.apply(init_weights)
+
         if use_discrete_vertex_embeddings:
             self.vertex_embd = nn.Embedding(256, self.embedding_dim)
         else:
@@ -385,8 +390,19 @@ class FaceModel(nn.Module):
         self.stopping_embeddings = torch.nn.Parameter(torch.randn([1, 2, self.embedding_dim]))
         self.embed_zero = torch.nn.Parameter(torch.randn([1, 1, self.embedding_dim]))
 
-        self.decoder = TransformerDecoder(**decoder_config)
-        self.encoder = TransformerEncoder(**encoder_config)
+        decoder_layer = nn.TransformerDecoderLayer(d_model=decoder_config['embd_size'], 
+                                                   dim_feedforward=decoder_config['fc_size'], 
+                                                   nhead=decoder_config['n_head'], 
+                                                   dropout=decoder_config['dropout_rate'])
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=decoder_config['num_layers'])
+        
+        encoder_layer = nn.TransformerEncoderLayer(d_model=encoder_config['embd_size'], 
+                                                   dim_feedforward=encoder_config['fc_size'], 
+                                                   nhead=encoder_config['n_head'], 
+                                                   dropout=encoder_config['dropout_rate'])
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=encoder_config['num_layers'])
+        """ self.decoder = TransformerDecoder(**decoder_config)
+        self.encoder = TransformerEncoder(**encoder_config) """
     
     def prepare_context(self, context):
         """Prepare class label context."""
@@ -475,25 +491,27 @@ class FaceModel(nn.Module):
         # Pass through Transformer decoder
         if cache is not None:
             decoder_inputs = decoder_inputs[:, -1:]
+        
         decoder_outputs = self.decoder(
             decoder_inputs,
             cache=cache,
             sequential_context_embeddings=sequential_context_embeddings)
 
-        # Get pointers
-        pred_pointers = self._project_to_pointers(decoder_outputs)
-
+        # Get pointers by projecting transformer outputs to pointer vectors.
+        pred_pointers = self.project_to_pointers(decoder_outputs)
+       
         # Get logits and mask
-        logits = tf.matmul(pred_pointers, vertex_embeddings, transpose_b=True)
-        logits /= tf.sqrt(float(self.embedding_dim))
-        f_verts_mask = tf.pad(
-            vertices_mask, [[0, 0], [2, 0]], constant_values=1.)[:, None]
+        #print(pred_pointers.shape, vertex_embeddings.shape)
+        logits = torch.matmul(pred_pointers, vertex_embeddings.transpose(1,2))
+        logits /= math.sqrt(float(self.embedding_dim))
+        f_verts_mask = F.pad(
+            vertices_mask, (2,0), value=1.).unsqueeze(1)
         logits *= f_verts_mask
         logits -= (1. - f_verts_mask) * 1e9
         logits /= temperature
         logits = top_k_logits(logits, top_k)
         logits = top_p_logits(logits, top_p)
-        return tfd.Categorical(logits=logits)
+        return torch.distributions.Categorical(logits=logits)
     
     def __call__(self, batch, is_training=False):
         """Pass batch through face model and get log probabilities.
@@ -521,7 +539,106 @@ class FaceModel(nn.Module):
             sequential_context_embeddings=seq_context)
         return pred_dist
 
+    @torch.no_grad()
+    def sample(self,
+             context,
+             max_sample_length=None,
+             temperature=1.,
+             top_k=0,
+             top_p=1.,
+             only_return_complete=True):
+        """Sample from face model using caching.
 
+        Args:
+        context: Dictionary of context, including 'vertices' and 'vertices_mask'.
+            See _prepare_context for details.
+        max_sample_length: Maximum length of sampled vertex sequences. Sequences
+            that do not complete are truncated.
+        temperature: Scalar softmax temperature > 0.
+        top_k: Number of tokens to keep for top-k sampling.
+        top_p: Proportion of probability mass to keep for top-p sampling.
+        only_return_complete: If True, only return completed samples. Otherwise
+            return all samples along with completed indicator.
+
+        Returns:
+        outputs: Output dictionary with fields:
+            'completed': Boolean tensor of shape [num_samples]. If True then
+            corresponding sample completed within max_sample_length.
+            'faces': Tensor of samples with shape [num_samples, num_verts, 3].
+            'num_face_indices': Tensor indicating number of vertices for each
+            example in padded vertex samples.
+        """
+        self.eval()
+
+        vertex_embeddings, global_context, seq_context = self.prepare_context(context)
+        num_samples = vertex_embeddings.shape[0]
+
+        # Initial values for loop variables
+        samples = torch.zeros([num_samples, 0], dtype=torch.int32)
+        max_sample_length = max_sample_length or self.max_seq_length
+        cache = self.decoder.create_init_cache(num_samples)
+
+        stop_cond = False
+        i = 0
+        with torch.no_grad():
+            while not stop_cond and i < max_sample_length:
+                cat_dist = self.create_vertex_indices_dist(
+                    vertex_embeddings,
+                    context['vertices_mask'],
+                    samples,
+                    global_context_embedding=global_context,
+                    sequential_context_embeddings=seq_context,
+                    cache=cache,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p)
+                next_sample = cat_dist.sample()[:, -1:]
+                samples = torch.cat([samples, next_sample], dim=1)
+                stop_cond = torch.eq(samples, 0).any(-1).all() # stop once all samples have a 0 (stop token)
+                i += 1
+
+        # Record completed samples
+        complete_samples = torch.eq(samples, 0).any(-1)
+
+        # Find number of faces
+        sample_length = samples.shape[-1]
+        samples_range = torch.range(0, max(sample_length,1)-1).unsqueeze(0)
+  
+        # Get largest new face (1 is new face token) index as stopping point for incomplete samples.
+        max_one_ind = torch.max(
+            samples_range * (torch.eq(samples, 1)).int(),
+            dim=-1)[1]
+
+        zero_inds = torch.argmax(torch.eq(samples, 0).int(), axis=-1) # completed sample indices
+        num_face_indices = torch.where(complete_samples, zero_inds, max_one_ind) + 1
+
+        # Mask faces beyond stopping token with zeros
+        # This mask has a -1 in order to replace the last new face token with zero
+        faces_mask = (samples_range < num_face_indices.unsqueeze(-1) - 1).int()
+        samples *= faces_mask
+        # This is the real mask which keeps the last new face token
+        faces_mask = (samples_range < num_face_indices.unsqueeze(-1)).int()
+
+        # Pad to maximum size with zeros
+        pad_size = max_sample_length - sample_length
+        samples = F.pad(samples, (0, pad_size))
+
+        if only_return_complete: # mask out incomplete samples
+            samples = samples[complete_samples]
+            num_face_indices = num_face_indices[complete_samples]
+            for key in context:
+                context[key] = context[key][complete_samples]
+            complete_samples = complete_samples[complete_samples]
+
+        # outputs
+        outputs = {
+            'context': context,
+            'completed': complete_samples,
+            'faces': samples,
+            'num_face_indices': num_face_indices,
+        }
+        self.train()
+        return outputs
 
 
 class LayerNorm(nn.Module):
@@ -576,24 +693,33 @@ class SelfAttention(nn.Module):
         # 3 * config.n_embd so that the output can be split into key, query and value tensors.
         # Saves having to make 3 different linear layers
         self.qvk_proj = nn.Linear(embd_size, 3 * embd_size, bias=bias)
+        #self.q_proj = nn.Linear(embd_size, embd_size, bias=bias)
+        #self.v_proj = nn.Linear(embd_size, embd_size, bias=bias)
+        #self.k_proj = nn.Linear(embd_size, embd_size, bias=bias)
         # output projection
         self.out_proj = nn.Linear(embd_size, embd_size, bias=bias)
 
-    def forward(self, x, enc_in=None, key_padding_mask=None):
+    def forward(self, x, context_embedding=None, key_padding_mask=None, cache=None):
         b, seq_len, n_embd = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.qvk_proj(x).split(self.n_embd, dim=2)
-
-        if enc_in is not None:
-            _, k, v  = self.qvk_proj(enc_in).split(self.n_embd, dim=2)
-
+     
+        if context_embedding is not None:
+            #_, k, v  = self.qvk_proj(context_embedding).split(self.n_embd, dim=2)
+            _, k, v = context_embedding.split(self.n_embd, dim=2)
+        elif cache is not None:
+            k_old, v_old = cache['k'], cache['v']
+            if k_old.shape[1] != 0: # dim 1 is the sequence length, 0 means first iter so no cache saved
+                k = torch.cat((k_old, k), dim=2)
+                v = torch.cat((v_old, v), dim=2)
+        
         q = q.view(b, seq_len, self.n_head, n_embd // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         k = k.view(b, seq_len, self.n_head, n_embd // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(b, seq_len, self.n_head, n_embd // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         if key_padding_mask is not None:
-            key_padding_mask = key_padding_mask.view(b, 1, 1, seq_len).expand(-1, self.n_head, -1, -1).reshape(b * self.n_head, 1, seq_len)
+            key_padding_mask = key_padding_mask.view(b, 1, 1, seq_len).expand(
+                -1, self.n_head, -1, -1).reshape(b * self.n_head, 1, seq_len)
             attn_mask = key_padding_mask.view(b, self.n_head, -1, seq_len)
         else:
             attn_mask = None
@@ -601,7 +727,13 @@ class SelfAttention(nn.Module):
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
             # much faster than other implementation!!
-            attn_weight = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=self.dropout if self.training else 0, is_causal=self.causal)
+            attn_weight = torch.nn.functional.scaled_dot_product_attention(
+                q, 
+                k, 
+                v, 
+                attn_mask=attn_mask, 
+                dropout_p=self.dropout if self.training else 0, 
+                is_causal=self.causal)
         else:
             attn_dropout = self.dropout if self.training else 0
             attn = (q @ k.transpose(-2, -1)) / math.sqrt(q.size(-1))
@@ -703,11 +835,11 @@ class TransformerDecoderBlock(nn.Module):
                  layer_norm=True,
                  dropout_rate=0.2,
                  bias=True, 
-                 take_encoder_input=False):
+                 take_context_embedding=False):
         super().__init__()
 
         self.layer_norm = layer_norm
-        self.take_encoder_input = take_encoder_input
+        self.take_context_embedding = take_context_embedding
 
         self.masked_multi_head_attn = SelfAttention(embd_size, num_heads, bias, dropout_rate, causal=True)
         self.feed_forward = MLP(embd_size, fc_size, bias, dropout_rate)
@@ -716,17 +848,17 @@ class TransformerDecoderBlock(nn.Module):
             self.layer_norm_3 = LayerNorm(embd_size, bias=bias)
   
         # Check if the decoder will take input from an encoder
-        if take_encoder_input:
+        if take_context_embedding:
             self.multi_head_attn = SelfAttention(embd_size, num_heads, bias, dropout_rate, causal=False)
             if layer_norm:
               self.layer_norm_2 = LayerNorm(embd_size, bias=bias)
 
-    def forward(self, x, enc_in=None, key_padding_mask=None):
+    def forward(self, x, context_embedding=None, key_padding_mask=None, cache=None):
         x_ln = self.layer_norm_1(x) if self.layer_norm else x
-        x = x + self.masked_multi_head_attn(x_ln, key_padding_mask=key_padding_mask)
-        if self.take_encoder_input:
+        x = x + self.masked_multi_head_attn(x_ln, key_padding_mask=key_padding_mask, cache=cache)
+        if context_embedding is not None and self.take_context_embedding:
             x_ln = self.layer_norm_2(x) if self.layer_norm else x
-            x = x + self.multi_head_attn(x_ln, enc_in=enc_in, key_padding_mask=key_padding_mask)
+            x = x + self.multi_head_attn(x_ln, context_embedding=context_embedding, key_padding_mask=key_padding_mask, cache=cache)
         x_ln = self.layer_norm_3(x) if self.layer_norm else x
         x = x + self.feed_forward(x_ln)
         return x
@@ -741,7 +873,7 @@ class TransformerDecoder(nn.Module):
                  num_layers=8,
                  dropout_rate=0.2,
                  bias=True,
-                 take_encoder_input=False):
+                 take_context_embedding=False):
         super().__init__()
         self.layers = nn.ModuleList([
             TransformerDecoderBlock(embd_size,
@@ -750,7 +882,7 @@ class TransformerDecoder(nn.Module):
                  layer_norm,
                  dropout_rate,
                  bias, 
-                 take_encoder_input=take_encoder_input) for _ in range(num_layers)])
+                 take_context_embedding=take_context_embedding) for _ in range(num_layers)])
         self.embd_size = embd_size
         self.num_heads = num_heads
         self.num_layers = num_layers
@@ -763,24 +895,18 @@ class TransformerDecoder(nn.Module):
                 key_padding_mask=None, 
                 cache=None,
                 sequential_context_embeddings=None):
-        for layer in self.layers:
-            x = layer(x, enc_in=sequential_context_embeddings, key_padding_mask=key_padding_mask)
+        for i, layer in enumerate(self.layers):
+            cache_i = None if cache is None else cache[i]
+            x = layer(x, context_embedding=sequential_context_embeddings, key_padding_mask=key_padding_mask, cache=cache_i)
         return self.layer_norm(x) if self.layer_norm else x
     
     def create_init_cache(self, batch_size):
-        #Creates empty cache dictionary for use in fast decoding.
-
-        """ def compute_cache_shape_invariants(tensor):
-            #Helper function to get dynamic shapes for cache tensors.
-            shape_list = tensor.shape.as_list()
-            if len(shape_list) == 4:
-                return tf.TensorShape(
-                    [shape_list[0], shape_list[1], None, shape_list[3]])
-            elif len(shape_list) == 3:
-                return tf.TensorShape([shape_list[0], None, shape_list[2]]) """
+        """ Creates empty cache dictionary for use in fast decoding. """
 
         # Build cache
-        k = torch.zeros([batch_size, 0, self.embd_size]).view(
+        k = torch.zeros([batch_size, 0, self.embd_size])
+        v = torch.zeros([batch_size, 0, self.embd_size])
+        """ k = torch.zeros([batch_size, 0, self.embd_size]).view(
             batch_size, 
             self.num_heads, 
             0, 
@@ -789,12 +915,10 @@ class TransformerDecoder(nn.Module):
             batch_size, 
             self.num_heads, 
             0, 
-            self.embd_size // self.num_heads)
+            self.embd_size // self.num_heads) """
 
         cache = [{'k': k, 'v': v} for _ in range(self.num_layers)]
-        """ shape_invariants = tf.nest.map_structure(
-            compute_cache_shape_invariants, cache) """
-        return cache#, shape_invariants
+        return cache
 
 
 class EncoderDecoder(nn.Module):
