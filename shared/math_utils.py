@@ -8,7 +8,7 @@ def top_k_logits(logits, k):
   else:
     values, _ = torch.topk(logits, k=k)
     k_largest = torch.min(values)
-    logits = torch.where(logits >= k_largest, logits, torch.ones_like(logits)*-1e9)
+    logits = torch.where(logits <= k_largest, torch.ones_like(logits)*-1e9, logits)
     return logits
   
 def top_p_logits(logits, p):

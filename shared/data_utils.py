@@ -109,7 +109,6 @@ def dequantize_verts(verts, n_bits=8, add_noise=False):
     min_range = -0.5
     max_range = 0.5
     range_quantize = 2**n_bits - 1
-    #verts = tf.cast(verts, tf.float32)
     verts = verts.float()
     verts = verts * (max_range - min_range) / range_quantize + min_range
     if add_noise:
@@ -134,7 +133,7 @@ def make_face_model_dataset(
       face_permutation = torch.cat(
           [torch.tensor([0,1], dtype=torch.int32), torch.argsort(permutation) + 2],
           dim=0)
-      example['faces'] = example['faces'][face_permutation].long()
+      example['faces'] = face_permutation[example['faces']].long()
 
     # Vertices are quantized. So convert to floats for input to face model
     example['vertices'] = dequantize_verts(vertices, quantization_bits)
