@@ -2,10 +2,10 @@ import torch
 import torch.nn as nn
 import math
 import torch.nn.functional as F
-import inspect
 from shared.data_utils import dequantize_verts, quantize_verts
 from shared.math_utils import top_k_logits, top_p_logits
         
+
 def init_weights_kaiming_uniform(m, mode='fan_in', nonlinearity='relu'):
     if isinstance(m, nn.Linear):
         nn.init.kaiming_uniform_(m.weight, mode=mode, nonlinearity=nonlinearity)
@@ -41,7 +41,8 @@ class VertexModel(nn.Module):
                class_conditional=False,
                num_classes=55,
                max_num_input_verts=2500,
-               use_discrete_embeddings=True):
+               use_discrete_embeddings=True,
+               device='cpu'):
         """Initializes VertexModel.
 
         Args:
@@ -61,6 +62,7 @@ class VertexModel(nn.Module):
         self.max_num_input_verts = max_num_input_verts
         self.quantization_bits = quantization_bits
         self.use_discrete_embeddings = use_discrete_embeddings
+        self.device = device
 
         # Embedding initialization
         self.label_embd = nn.Embedding(self.num_classes, self.embedding_dim)
@@ -82,7 +84,9 @@ class VertexModel(nn.Module):
         self.embed_zeros = nn.Parameter(torch.rand((1, 1, self.embedding_dim)))
   
         self.decoder = TransformerDecoder(**decoder_config, bias=False)
+        
         self.apply(init_weights_kaiming_uniform)
+        self.to(device)
 
     def prepare_context(self, context):
         """Prepare class label context."""
@@ -97,7 +101,7 @@ class VertexModel(nn.Module):
         # Dequantize inputs and get shapes
         input_shape = vertices.shape
         batch_size, seq_length = input_shape[0], input_shape[1]
-        seq_range = torch.arange(seq_length)
+        seq_range = torch.arange(seq_length, device=self.device)
       
         # indicates whether the input token is an x, y, or z coordinate
         coord_embeddings = self.coord_embd(seq_range % 3) #[0,1,2,0,1,2,...] 
@@ -111,6 +115,7 @@ class VertexModel(nn.Module):
             vert_embeddings = self.vertex_embd(vertices)
         # Continuous vertex value embeddings
         else:
+            # Pad vertices to max_num_input_verts for the linear layer
             n_pad = self.max_num_input_verts - input_shape[1]
             pad_vertices = F.pad(vertices, (0, n_pad))
             vert_embeddings = self.vertex_embd(dequantize_verts(pad_vertices.unsqueeze(1), self.quantization_bits))
@@ -150,12 +155,11 @@ class VertexModel(nn.Module):
             decoder_inputs, 
             query_padding_mask=vertices_mask,
             cache=cache,
-            sequential_context_embeddings=sequential_context_embeddings)
+            context_embeddings=sequential_context_embeddings)
 
         # Get logits and optionally process for sampling
         logits = self.project_to_logits(outputs)
         logits /= temperature
-        
         logits = top_k_logits(logits, top_k)
         logits = top_p_logits(logits, top_p)
         cat_dist = torch.distributions.Categorical(logits=logits)
@@ -173,7 +177,6 @@ class VertexModel(nn.Module):
         pred_dist: tfd.Categorical predictive distribution with batch shape
             [batch_size, seq_length].
         """
-    
         global_context, seq_context = self.prepare_context(batch)
         pred_dist = self.create_vertex_coordinate_dist(
             batch['vertices_flat'][:, :-1],  # Last element not used for preds
@@ -234,7 +237,7 @@ class VertexModel(nn.Module):
             seq_context = seq_context[:num_samples]
 
         # Initial values for loop variables
-        samples = torch.zeros([num_samples, 0], dtype=torch.int32)
+        samples = torch.zeros([num_samples, 0], dtype=torch.int32, device=self.device)
 
         if max_sample_length is not None and max_sample_length <= self.max_num_input_verts:
             max_sample_length = max_sample_length
@@ -245,20 +248,19 @@ class VertexModel(nn.Module):
         stop_cond = False
         i = 0
         max_iters = max_sample_length * 3 + 1
-        with torch.no_grad():
-            while not stop_cond and i < max_iters:
-                cat_dist = self.create_vertex_coordinate_dist(
-                    samples,
-                    global_context_embedding=global_context,
-                    sequential_context_embeddings=seq_context,
-                    cache=cache,
-                    temperature=temperature,
-                    top_k=top_k,
-                    top_p=top_p)
-                next_sample = cat_dist.sample()[:, -1:]
-                samples = torch.cat([samples, next_sample], dim=1)
-                stop_cond = torch.eq(samples, 0).any(-1).all() # stop once all samples have a 0 (stop token)
-                i += 1
+        while not stop_cond and i < max_iters:
+            cat_dist = self.create_vertex_coordinate_dist(
+                samples,
+                global_context_embedding=global_context,
+                sequential_context_embeddings=seq_context,
+                cache=cache,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p)
+            next_sample = cat_dist.sample()[:, -1:]
+            samples = torch.cat([samples, next_sample], dim=1)
+            stop_cond = torch.eq(samples, 0).any(-1).all() # stop once all samples have a 0 (stop token)
+            i += 1
         del cache
         # Check if samples completed. Samples are complete if the stopping token
         # is produced.
@@ -270,7 +272,7 @@ class VertexModel(nn.Module):
         stop_index_completed = torch.eq(samples, 0).int().argmax(dim=-1)
         # For incomplete samples the stopping index is just the maximum index.
         stop_index_incomplete = (
-            max_sample_length * 3 * torch.ones_like(stop_index_completed))
+            max_sample_length * 3 * torch.ones_like(stop_index_completed, device=self.device))
     
         # if completed use the completed index else use incomplete index
         stop_index = torch.where(
@@ -292,7 +294,8 @@ class VertexModel(nn.Module):
         vertices = F.pad(vertices, (0,0,0,pad_size))
 
         # 3D Vertex mask
-        vertices_mask = torch.where(torch.arange(max_sample_length) < num_vertices.unsqueeze(1), 1.0, 0.0)
+        vertices_mask = torch.where(torch.arange(max_sample_length, device=self.device) < 
+                                    num_vertices.unsqueeze(1), 1.0, 0.0)
 
         if recenter_verts:
             vert_max = torch.max(
@@ -320,6 +323,12 @@ class VertexModel(nn.Module):
         }
         self.train()
         return outputs
+    
+    def to(self, device=None, **kwargs):
+        module = super(VertexModel, self).to(device, **kwargs)
+        module.device = device
+        return module
+    
 
 class FaceModel(nn.Module):
     """Autoregressive generative model of n-gon meshes.
@@ -346,7 +355,8 @@ class FaceModel(nn.Module):
                 use_discrete_vertex_embeddings=True,
                 quantization_bits=8,
                 max_num_input_verts=2500,
-                max_seq_length=5000):
+                max_seq_length=5000,
+                device='cpu'):
         """Initializes FaceModel.
 
         Args:
@@ -371,6 +381,7 @@ class FaceModel(nn.Module):
         self.use_discrete_vertex_embeddings = use_discrete_vertex_embeddings
         self.quantization_bits = quantization_bits
         self.max_num_input_verts = max_num_input_verts
+        self.device = device
 
         self.label_embd = nn.Embedding(self.num_classes, self.embedding_dim)
         self.pos_embd = nn.Embedding(self.max_seq_length, self.embedding_dim)
@@ -389,7 +400,9 @@ class FaceModel(nn.Module):
 
         self.decoder = TransformerDecoder(**decoder_config, bias=False)
         self.encoder = TransformerEncoder(**encoder_config, bias=False)
+        
         self.apply(init_weights_kaiming_uniform)
+        self.to(device)
     
     def prepare_context(self, context):
         """Prepare class label context."""
@@ -433,8 +446,8 @@ class FaceModel(nn.Module):
         
         # Pass through Transformer encoder
         vertices_mask = F.pad(vertices_mask, (2,0), value=1.) # pad for stopping and new face tokens
-        vertex_embeddings = self.encoder(vertex_embeddings, query_padding_mask=vertices_mask)
         
+        vertex_embeddings = self.encoder(vertex_embeddings, query_padding_mask=vertices_mask)
         return vertex_embeddings
     
     def embed_inputs(self, faces_long, vertex_embeddings,
@@ -449,7 +462,7 @@ class FaceModel(nn.Module):
         )(vertex_embeddings, 0, faces_long) # essentially gather on batched tensor
   
         # Position of vertex in face
-        pos_embeddings = self.pos_embd(torch.arange(faces_long.shape[1])) 
+        pos_embeddings = self.pos_embd(torch.arange(faces_long.shape[1], device=self.device)) 
 
         # Step zero embeddings
         batch_size = face_embeddings.shape[0]
@@ -466,8 +479,9 @@ class FaceModel(nn.Module):
     
     def create_vertex_indices_dist(self,
                    vertex_embeddings,
-                   vertices_mask,
                    faces_long,
+                   vertices_mask=None,
+                   faces_mask=None,
                    global_context_embedding=None,
                    sequential_context_embeddings=None,
                    temperature=1.,
@@ -487,20 +501,20 @@ class FaceModel(nn.Module):
         if vertices_mask is not None:
             # append 1 to start of mask to account for the input embedding
             vertices_mask = F.pad(vertices_mask, (2, 0), value=1.)
-
-        if sequential_context_embeddings is not None:
-            kv_padding_mask = vertices_mask
-        else:
-            kv_padding_mask = None
+        if faces_mask is not None:
+            # append 1 to start of mask to account for the input embedding
+            faces_mask = F.pad(faces_mask, (1, 0), value=1.)
 
         decoder_outputs = self.decoder(
             decoder_inputs,
-            kv_padding_mask=kv_padding_mask,
+            query_padding_mask=faces_mask,
+            kv_padding_mask=vertices_mask,
             cache=cache,
-            sequential_context_embeddings=sequential_context_embeddings)
+            context_embeddings=sequential_context_embeddings)
 
         # Get pointers by projecting transformer outputs to pointer vectors.
         pred_pointers = self.project_to_pointers(decoder_outputs)
+        
         # pointer vector is compared to the input embeddings to get vertex scores
         logits = torch.matmul(pred_pointers, vertex_embeddings.transpose(1,2))
         logits /= math.sqrt(self.embedding_dim)
@@ -532,10 +546,12 @@ class FaceModel(nn.Module):
   
         vertex_embeddings, global_context, seq_context = self.prepare_context(batch)
         
+        faces_mask = torch.ne(batch['faces'][:, :-1], 0).float()
         pred_dist = self.create_vertex_indices_dist(
             vertex_embeddings,
-            batch['vertices_mask'],
             batch['faces'][:, :-1],
+            vertices_mask=batch['vertices_mask'],
+            faces_mask=faces_mask,
             global_context_embedding=global_context,
             sequential_context_embeddings=seq_context)
         return pred_dist
@@ -574,35 +590,35 @@ class FaceModel(nn.Module):
         num_samples = vertex_embeddings.shape[0]
 
         # Initial values for loop variables
-        samples = torch.zeros([num_samples, 0], dtype=torch.int32)
+        samples = torch.zeros([num_samples, 0], dtype=torch.int32, device=self.device)
         max_sample_length = max_sample_length or self.max_seq_length
-
+        
         cache = self.decoder.create_init_cache(num_samples)
         stop_cond = False
         i = 0
-        with torch.no_grad():
-            while not stop_cond and i < max_sample_length:
-                cat_dist = self.create_vertex_indices_dist(
-                    vertex_embeddings,
-                    context['vertices_mask'],
-                    samples,
-                    global_context_embedding=global_context,
-                    sequential_context_embeddings=seq_context,
-                    cache=cache,
-                    temperature=temperature,
-                    top_k=top_k,
-                    top_p=top_p)
-                next_sample = cat_dist.sample()[:, -1:]
-                samples = torch.cat([samples, next_sample], dim=1)
-                stop_cond = torch.eq(samples, 0).any(-1).all() # stop once all samples have a 0 (stop token)
-                i += 1
+        while not stop_cond and i < max_sample_length:
+            cat_dist = self.create_vertex_indices_dist(
+                vertex_embeddings,
+                samples,
+                vertices_mask=context['vertices_mask'],
+                global_context_embedding=global_context,
+                sequential_context_embeddings=seq_context,
+                cache=cache,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p)
+            next_sample = cat_dist.sample()[:, -1:]
+            samples = torch.cat([samples, next_sample], dim=1)
+            stop_cond = torch.eq(samples, 0).any(-1).all() # stop once all samples have a 0 (stop token)
+            i += 1
         del cache
+
         # Record completed samples
         complete_samples = torch.eq(samples, 0).any(-1)
 
         # Find number of faces
         sample_length = samples.shape[-1]
-        samples_range = torch.arange(sample_length).unsqueeze(0)
+        samples_range = torch.arange(sample_length, device=self.device).unsqueeze(0)
   
         # Get largest new face (1 is new face token) index as stopping point for incomplete samples.
         max_one_ind = torch.max(
@@ -615,7 +631,8 @@ class FaceModel(nn.Module):
         # Mask faces beyond stopping token with zeros
         # This mask has a -1 in order to replace the last new face token with zero
         faces_mask = (samples_range < num_face_indices.unsqueeze(-1) - 1).int()
-        samples *= faces_mask
+     
+        samples = samples * faces_mask
         # This is the real mask which keeps the last new face token
         faces_mask = (samples_range < num_face_indices.unsqueeze(-1)).int()
 
@@ -639,6 +656,11 @@ class FaceModel(nn.Module):
         }
         self.train()
         return outputs
+    
+    def to(self, device=None, **kwargs):
+        module = super(FaceModel, self).to(device, **kwargs)
+        module.device = device
+        return module
 
 
 class LayerNorm(nn.Module):
@@ -664,11 +686,7 @@ class DotProductAttention(nn.Module):
         self.n_embd = embd_size
         self.dropout = dropout_rate
 
-        # regularization
-        self.attn_dropout = nn.Dropout(dropout_rate)
-
-        #self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        self.flash = False
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
 
         self.q_proj = nn.Linear(embd_size, embd_size, bias=bias)
         self.v_proj = nn.Linear(embd_size, embd_size, bias=bias)
@@ -681,8 +699,7 @@ class DotProductAttention(nn.Module):
                 context_embedding=None, 
                 query_padding_mask = None, 
                 kv_padding_mask=None, 
-                cache=None,
-                causal=False):
+                cache=None):
         # if context_embedding is None then self attention is being used
         # otherwise the encoder output is being used for cross attention
         b, query_seq_len, n_embd = query.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -690,10 +707,12 @@ class DotProductAttention(nn.Module):
         q = self.q_proj(query)
         
         if context_embedding is None or cache is None:
+            # use query for both key and value if context_embedding is not given (self attention)
             kv = context_embedding if context_embedding is not None else query
             k = self.k_proj(kv)
             v = self.v_proj(kv)
 
+        # reuse k and v if cache is given to avoid recomputing everytime
         if cache is not None:
             k_old, v_old = cache['k'], cache['v']
             if k_old.shape[1] == 0: # dim 1 is the sequence length, 0 means first iter so no cache saved
@@ -704,52 +723,39 @@ class DotProductAttention(nn.Module):
                 v = cache['v'] = torch.cat((v_old, v), dim=1)
         
         context_seq_len = k.shape[1]
+        # split into heads and reshape for attention
         q = q.view(b, query_seq_len, self.n_head, n_embd // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         k = k.view(b, context_seq_len, self.n_head, n_embd // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(b, context_seq_len, self.n_head, n_embd // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-     
-        if query_padding_mask is not None and not causal:
-            attn_mask = query_padding_mask.view(b, 1, 1, query_seq_len)
-            if kv_padding_mask is not None:
-                attn_mask = torch.logical_or(attn_mask, kv_padding_mask.view(b, 1, 1, context_seq_len))
-            attn_mask = torch.where(attn_mask == 0, -1e9, 0.)
-        elif kv_padding_mask is not None and not causal: 
-            attn_mask = kv_padding_mask.view(b, 1, 1, context_seq_len)
-            attn_mask = torch.where(attn_mask == 0, -1e9, 0.)
+
+        if query_padding_mask is not None:
+            attn_mask = query_padding_mask.view(b, 1, -1, query_seq_len)
+        elif kv_padding_mask is not None:
+            attn_mask = kv_padding_mask.view(b, 1, -1, context_seq_len)
         else:
-            attn_mask = None
-        
+            attn_mask = torch.zeros(1,1,1,1, device=query.device) # unmasked
+
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            # much faster than other implementation!!
-            #torch.nn.functional.multi_head_attention_forward
+            # faster overall compared to other implementation but takes more steps to learn
             attn_weight = torch.nn.functional.scaled_dot_product_attention(
                 q, 
                 k, 
                 v, 
                 attn_mask=attn_mask, 
-                dropout_p=self.dropout if self.training else 0, 
-                is_causal=causal)
+                dropout_p=self.dropout if self.training else 0)
         else:
             # scaled dot product attention between query and key to see how much they relate to each other
-            attn = (q @ k.transpose(-2, -1)) #/ math.sqrt(q.size(-1)) # * (1.0 / math.sqrt(k.size(-1)))
-            #attn = (q @ k.transpose(-2, -1))# * (1.0 / math.sqrt(k.size(-1)))
-            # Mask future and padding tokens
-            if causal:
-                attn_mask = torch.ones(query_seq_len, query_seq_len, device=query.device).tril(diagonal=0)
-                attn_mask = torch.where(attn_mask == 0, -1e9, 0.)
-            if attn_mask is not None:
-                attn += attn_mask
-
-            attn_weight = torch.softmax(attn, dim=-1)
+            attn_weight = torch.softmax((q @ k.transpose(-2, -1) / math.sqrt(q.size(-1))) + attn_mask, dim=-1)
             attn_weight = torch.dropout(attn_weight, self.dropout, self.training) 
             # multiplying by value gives proportions of value according to the attention weights
             # this produces the predicting vector given q,v,k
             attn_weight  = attn_weight @ v # (b, nh, seq_len, seq_len) x (b, nh, seq_len, hs) -> (b, nh, seq_len, hs)
-        attn_weight = attn_weight.transpose(1, 2).contiguous().view(b, query_seq_len, n_embd) # re-assemble all head outputs side by side
+        attn_weight = attn_weight.transpose(1, 2).reshape(b, query_seq_len, n_embd)# re-assemble all head outputs side by side #
+      
         # output projection
-        attn_weight = self.out_proj(attn_weight)
-        return attn_weight
+        out = self.out_proj(attn_weight)
+        return out
 
 
 class MLP(nn.Module):
@@ -757,9 +763,7 @@ class MLP(nn.Module):
     def __init__(self, embd_size=256, fc_size=1024, bias=True):
         super().__init__()
         self.fc = nn.Linear(embd_size, fc_size, bias=bias)
-        #self.fc.apply(init_weights_xavier_uniform)
         self.out_proj  = nn.Linear(fc_size, embd_size, bias=bias)
-        #self.out_proj.apply(init_weights_xavier_uniform)
 
     def forward(self, x):
         x = F.relu(self.fc(x))
@@ -795,8 +799,7 @@ class TransformerEncoderBlock(nn.Module):
     def forward(self, x, query_padding_mask=None):
         residual = self.layer_norm_1(x) if self.layer_norm else x
         residual = self.self_attention(residual, 
-                                query_padding_mask=query_padding_mask,
-                                causal=False)
+                                query_padding_mask=query_padding_mask)
         if self.re_zero:
             residual *= self.self_attention_alpha
         x = x + residual
@@ -834,6 +837,8 @@ class TransformerEncoder(nn.Module):
      
 
     def forward(self, x, query_padding_mask=None):
+        if query_padding_mask is not None:
+            query_padding_mask = (1-query_padding_mask) * -1e9
         for layer in self.layers:
             x = layer(x, query_padding_mask=query_padding_mask)
         
@@ -875,16 +880,14 @@ class TransformerDecoderBlock(nn.Module):
         self.register_parameter('feed_forward_alpha', nn.Parameter(torch.tensor(0.)))
         self.register_parameter('self_attention_alpha', nn.Parameter(torch.tensor(0.)))
         
-
     def forward(self, 
                 x, 
-                context_embedding=None, 
-                query_padding_mask=None, 
-                kv_padding_mask=None, 
+                context_embedding=None,
+                self_attn_mask=None, 
+                cross_attn_mask=None,
                 cache=None):
         res = self.layer_norm_1(x) if self.layer_norm else x
-        causal = True if cache is None else False
-        res = self.masked_self_attn(res, query_padding_mask=None, cache=cache, causal=causal)
+        res = self.masked_self_attn(res, query_padding_mask=self_attn_mask, cache=cache)
         if self.re_zero:
             res *= self.self_attention_alpha
         x = x + res
@@ -893,8 +896,7 @@ class TransformerDecoderBlock(nn.Module):
             # Cross attention with the output of the encoder
             res = self.cross_attention(res, 
                                          context_embedding=context_embedding,
-                                         kv_padding_mask=kv_padding_mask, 
-                                         causal=False)
+                                         kv_padding_mask=cross_attn_mask)
             if self.re_zero:
                 res *= self.cross_attention_alpha
             x = x + res
@@ -940,14 +942,41 @@ class TransformerDecoder(nn.Module):
                 query_padding_mask=None,
                 kv_padding_mask=None, 
                 cache=None,
-                sequential_context_embeddings=None):
+                context_embeddings=None):
+     
+        query_seq_len = x.shape[1]
+        # look ahead mask for decoder self attention
+        if query_padding_mask is not None:
+            # combine the query padding mask with the look ahead mask
+            if cache is None:
+                self_attn_mask = torch.logical_and(query_padding_mask.unsqueeze(1), 
+                                                   torch.ones(query_seq_len, 
+                                                              query_seq_len, 
+                                                              device=x.device).tril(diagonal=0)).float()
+            else:
+                self_attn_mask = query_padding_mask
+        else:
+            if cache is None:
+                self_attn_mask = torch.ones(query_seq_len, 
+                                            query_seq_len, 
+                                            device=x.device).tril(diagonal=0).float()
+            else:
+                self_attn_mask = None
+        
+        if self_attn_mask is not None:
+            # negate one make ones mean padding
+            # large negative number makes the probability after softmax zero to mask
+            self_attn_mask = (1-self_attn_mask) * -1e9 
+        if kv_padding_mask is not None:
+            kv_padding_mask = (1-kv_padding_mask) * -1e9
+   
         for i, layer in enumerate(self.layers):
             layer_cache = None if cache is None else cache[i]
             x = layer(x, 
-                      context_embedding=sequential_context_embeddings, 
-                      query_padding_mask=query_padding_mask,
-                      kv_padding_mask=kv_padding_mask, 
-                      cache=layer_cache)
+                      context_embedding=context_embeddings, 
+                      self_attn_mask=self_attn_mask,
+                      cross_attn_mask=kv_padding_mask, 
+                      cache=layer_cache) 
         if self.layer_norm:
             x = self.layer_norm(x)
         return x
@@ -959,196 +988,3 @@ class TransformerDecoder(nn.Module):
         v = torch.zeros([batch_size, 0, self.embd_size])
         cache = [{'k': k, 'v': v} for _ in range(self.num_layers)]
         return cache
-
-
-class EncoderDecoder(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-
-        self.config = config
-        self.device = config.device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        self.transformer = nn.ModuleDict(dict(
-            positional_enc = PositionalEncoding(config),
-            encoder = Encoder(config),
-            decoder = Decoder(config, True),
-        ))
-
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.positional_enc.token_embeddings.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
-       
-        # init all weights
-        self.apply(self._init_weights)
-        # apply special scaled init to the residual projections, per GPT-2 paper
-        for pn, p in self.named_parameters():
-            if pn.endswith('embd_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
-
-        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
-
-
-    def forward(self, inputs):
-        
-        target_true = torch.cat((inputs['label_ids'][:, 1:], torch.tensor([0]).expand(len(inputs['input_ids']),1)), dim=1).to(self.device)
-        inputs['label_ids'][:, inputs['label_ids'].argmin()-1] = 0
-
-        # Positional encoding
-        in_pos_enc = self.transformer.positional_enc(inputs['input_ids'].to(self.device))
-        
-        # Encoder
-        enc_attention_scores = self.transformer.encoder(in_pos_enc, key_padding_mask=inputs['input_attention_mask'].bool().to(self.device))
-        target_pos_enc = self.transformer.positional_enc(inputs['label_ids'].to(self.device))
-
-        # Decoder
-        decoder_out = self.transformer.decoder(target_pos_enc, enc_in=enc_attention_scores)
-
-        # if we are given some desired targets also calculate the loss
-        logits = self.lm_head(decoder_out)
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_true.contiguous().view(-1), ignore_index=0)
-
-        return logits, loss
-    
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
-        # first estimate the number of flops we do per iteration.
-        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
-        N = self.get_num_params()
-        cfg = self.config
-        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
-        flops_per_token = 6*N + 12*L*H*Q*T
-        flops_per_fwdbwd = flops_per_token * T
-        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
-        mfu = flops_achieved / flops_promised
-        return mfu
-
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        """
-        This long function is unfortunately doing something very simple and is being very defensive:
-        We are separating out all parameters of the model into two buckets: those that will experience
-        weight decay for regularization and those that won't (biases, and layernorm/embedding weights).
-        We are then returning the PyTorch optimizer object.
-        """
-
-        # separate out all parameters to those that will and won't experience regularizing weight decay
-        decay = set()
-        no_decay = set()
-        whitelist_weight_modules = (torch.nn.Linear, )
-        blacklist_weight_modules = (torch.nn.LayerNorm, LayerNorm, torch.nn.Embedding)
-        for mn, m in self.named_modules():
-            for pn, p in m.named_parameters():
-                fpn = '%s.%s' % (mn, pn) if mn else pn # full param name
-                # random note: because named_modules and named_parameters are recursive
-                # we will see the same tensors p many many times. but doing it this way
-                # allows us to know which parent module any tensor p belongs to...
-                if pn.endswith('bias'):
-                    # all biases will not be decayed
-                    no_decay.add(fpn)
-                elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
-                    # weights of whitelist modules will be weight decayed
-                    decay.add(fpn)
-                elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
-                    # weights of blacklist modules will NOT be weight decayed
-                    no_decay.add(fpn)
-
-        # subtle: 'transformer.wte.weight' and 'lm_head.weight' are tied, so they
-        # will appear in the no_decay and decay sets respectively after the above.
-        # In addition, because named_parameters() doesn't return duplicates, it
-        # will only return the first occurence, key'd by 'transformer.wte.weight', below.
-        # so let's manually remove 'lm_head.weight' from decay set. This will include
-        # this tensor into optimization via transformer.wte.weight only, and not decayed.
-        decay.remove('lm_head.weight')
-
-        # validate that we considered every parameter
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        
-        inter_params = decay & no_decay
-        union_params = decay | no_decay
-        assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params), )
-        assert len(param_dict.keys() - union_params) == 0, "parameters %s were not separated into either decay/no_decay set!" \
-                                                    % (str(param_dict.keys() - union_params), )
-
-        # create the pytorch optimizer object
-        optim_groups = [
-            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": weight_decay},
-            {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
-        ]
-        # new PyTorch nightly has a new 'fused' option for AdamW that is much faster
-        use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters)
-        print(f"using fused AdamW: {use_fused}")
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-
-        return optimizer
-    
-    
-    def get_num_params(self, non_embedding=True):
-        """
-        Return the number of parameters in the model.
-        For non-embedding count (default), the position embeddings get subtracted.
-        The token embeddings would too, except due to the parameter sharing these
-        params are actually used as weights in the final layer, so we include them.
-        """
-        n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.positional_enc.position_embeddings.weight.numel()
-        return n_params
-
-    @torch.no_grad()
-    def generate(self, inputs, max_new_tokens, temperature=1.0, top_k=None):
-        """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
-        """
-        # remove eos token
-        eos_token = 101 #inputs['label_ids'][0][1]
-        #inputs['label_ids'][0][1] = 0
-        #inputs
-        output = []
-        #print(inputs['input_ids'][0].shape)
-        
-        for i in range(1, max_new_tokens):
-            
-            """ # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:] """
-            #print("in", inputs['label_ids'][0])
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(inputs)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # Stop if eos token
-            #print(idx_next.item())
-            if idx_next.item() == eos_token:
-                break
-            # append sampled index to the running sequence and continue
-            #idx = torch.cat((idx, idx_next), dim=1)
-            inputs['label_ids'][0][i] = idx_next #= torch.cat((inputs['input_ids'][0], idx_next), dim=1)
-            inputs['label_attention_mask'][0][i] = True
-            #inputs['input_ids'][0][i] = idx_next
-            output.append(idx_next.item())
-
-        return output #inputs['label_ids'][0]
