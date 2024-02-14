@@ -160,7 +160,25 @@ cython_debug/
 #.idea/
 
 # Misc project files
+<<<<<<< HEAD
 Polygen Pytorch.code-workspace
 tf_dev.ipynb
 modules_tf.py
 dataset/
+=======
+checkpoints_chairs_and_benches/
+processed_chairs_and_benches/
+torch_compile_debug/
+wandb/
+filtered_by_num_verts_800
+config copy.json
+chkpt_200000.pt
+model_config.pt
+modules_causal.py
+modules_test.py
+modules_torch.py
+script.py
+test.py
+train_example copy.ipynb
+train_example_flashattn_test.ipynb
+>>>>>>> master
