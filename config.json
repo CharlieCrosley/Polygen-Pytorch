@@ -1,0 +1,41 @@
+{
+    "vertex_decoder_config" : {
+        "embd_size": 256, 
+        "fc_size": 1024, 
+        "num_layers": 14,
+        "num_heads": 8,
+        "dropout_rate": 0.2,
+        "take_context_embedding": true
+    },
+
+    "res_net_config" : {
+        "hidden_sizes": [64, 128, 256], 
+        "dropout_rate": 0.2, 
+        "num_blocks": [1,2,2], 
+        "re_zero":true, 
+        "kernel_size": [3,3], 
+        "bias": false
+    },
+
+    "face_encoder_config":{
+        "embd_size": 256,
+        "fc_size": 1024, 
+        "num_layers": 8,
+        "num_heads": 8,
+        "dropout_rate": 0.2
+    },
+
+    "face_decoder_config":{
+        "embd_size": 256,
+        "fc_size": 1024, 
+        "num_layers": 8,
+        "num_heads": 8,
+        "dropout_rate": 0.2,
+        "take_context_embedding": true
+    },
+
+    "max_num_input_verts": 550,
+    "max_num_face_sequence": 1200,
+    "quantization_bits": 8
+
+}
