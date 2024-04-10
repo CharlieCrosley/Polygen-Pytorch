@@ -17,6 +17,8 @@ All credit goes to deepmind.
 ## Pretrained weights
 Pretrained weights for a vertex and face model are available [here](https://www.dropbox.com/scl/fo/o0ur761yhw0cdk5nn06jb/AMxyYB87VJQ8W8zxkjJi-Lc?rlkey=y1a6g1cq68k164kmhgqt3mvgu&dl=0)
 The models were trained on single-view reconstruction for 3 categories (chair, bench, table) from the ShapeNetCore dataset.
+The input images are assumed to have a solid black background, currently the training and inference scripts create a mask to convert a constant grey background (background colour generated using blender in the gen_singleview_reconstruction_dataset.py script) to black.
+This code must be changed if using custom input images that don't have the same solid background colour.
 
 **Vertex model**. 
 - Trained for 600k steps
@@ -31,3 +33,4 @@ The models were trained on single-view reconstruction for 3 categories (chair, b
 
 This was trained on a single RTX 3060 so there was limitations on performance.
 inference.ipynb can be used to demonstrate the outputs using the var_0.png in the example_input/model_0 directory
+
