@@ -8,7 +8,7 @@ All credit goes to deepmind.
 ## Requirements
 
 - python == 3.11.4
-- pytorch == 2.0.1
+- pytorch == 2.3.0
 - matplotlib == 3.7.2
 - networkx == 3.0
 - six
