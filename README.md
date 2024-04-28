@@ -34,3 +34,7 @@ This code must be changed if using custom input images that don't have the same 
 This was trained on a single RTX 3060 so there was limitations on performance.
 inference.ipynb can be used to demonstrate the outputs using the var_0.png in the example_input/model_0 directory
 
+Below are some samples using image as input alongside class labels with top_p=0.6 so that there is some diversity of samples.
+<p align="center">
+  <img src="./polygen_samples.png">
+</p>
